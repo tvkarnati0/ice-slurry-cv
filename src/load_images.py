@@ -2,11 +2,21 @@
 Ice slurry melting analysis pipeline.
 
 Two parallel methods are run:
-  1. Box method       -- plain rectangular ROI mean intensity
-  2. Fixed-mask method -- user hand-sketches the slurry outline on
-                          frame 1 (mouse drag in a popup window),
-                          that shape is locked in and reused on every
-                          frame to track brightness + ice-fraction.
+  1. Box method    -- plain rectangular ROI mean intensity
+  2. Sketch method -- two-tier manual sketching:
+       a. FIXED CONTAINER REGION: sketched ONCE, on frame 1. Defines
+          the overall area where slurry/liquid sits. This stays
+          constant across all frames and is the ice_fraction
+          DENOMINATOR throughout.
+       b. PER-FRAME ICE SKETCH: sketched on EVERY frame (including
+          frame 1), tracing just the actual ice within the container.
+          This is the ice_fraction NUMERATOR for that frame.
+
+     ice_fraction = (ice pixels sketched this frame) / (fixed container pixels)
+
+     Because the denominator is fixed but the numerator is re-sketched
+     each frame, frame 1 does NOT have to equal 1.0 -- if some liquid
+     was already present at the start, frame 1's fraction reflects that.
 """
 
 import cv2
@@ -55,31 +65,29 @@ def get_brightness(gray_img, box):
 
 
 # ---------- Interactive freehand sketch -> filled mask ----------
-def sketch_mask(first_gray_img, box, save_path="output/fixed_mask_sketch.png", target_size=1200):
+def sketch_mask(gray_img, box, save_path, prompt_label, target_size=1200):
     """
-    Opens a window showing frame 1's ROI, upscaled so its largest
-    dimension is roughly `target_size` pixels, for easier sketching.
-    Click and drag to sketch an outline around the slurry. Press any
-    key when done. Returns the filled-in binary mask, sized to match
-    the ORIGINAL (non-upscaled) ROI dimensions.
+    Opens a window showing this frame's ROI, upscaled so its largest
+    dimension is roughly `target_size` pixels. Click and drag to sketch
+    an outline. Press any key when done. Returns the filled-in binary
+    mask, sized to match the ORIGINAL (non-upscaled) ROI dimensions.
+
+    `prompt_label` is shown in the window title so you know what to
+    sketch (e.g. "CONTAINER region" vs "ICE only").
     """
     x1, y1, x2, y2 = box
-    roi_patch = first_gray_img[y1:y2, x1:x2]
+    roi_patch = gray_img[y1:y2, x1:x2]
 
-    # scale so the larger dimension hits target_size, regardless of the ROI's original shape
     h, w = roi_patch.shape
     scale = target_size / max(h, w)
 
-    # upscale the actual image (not just the window) so click coordinates stay accurate
     display_img = cv2.resize(roi_patch, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
     display_img = cv2.cvtColor(display_img, cv2.COLOR_GRAY2BGR)
-    print(f"Sketch window: {roi_patch.shape[1]}x{roi_patch.shape[0]} -> "
-          f"displayed at {display_img.shape[1]}x{display_img.shape[0]} (scale={scale:.2f})")
 
     drawing = {"active": False}
     sketch_points = []
 
-    window_name = "Sketch around the slurry, then press any key when done"
+    window_name = f"Sketch the {prompt_label}, then press any key -- {save_path}"
 
     def draw_event(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -99,12 +107,9 @@ def sketch_mask(first_gray_img, box, save_path="output/fixed_mask_sketch.png", t
     cv2.setMouseCallback(window_name, draw_event)
     cv2.imshow(window_name, display_img)
 
-    # Use a polling loop instead of a single blocking waitKey(0) --
-    # this keeps the GUI event loop cycling so mouse-driven redraws
-    # (the green sketch line) actually render as you drag.
     while True:
         key = cv2.waitKey(20) & 0xFF
-        if key != 255:  # 255 means "no key pressed" during this poll
+        if key != 255:
             break
 
     cv2.destroyAllWindows()
@@ -112,65 +117,47 @@ def sketch_mask(first_gray_img, box, save_path="output/fixed_mask_sketch.png", t
     if len(sketch_points) < 3:
         raise ValueError("Not enough points sketched to form a shape. Try again.")
 
-    # scale points back down to the ORIGINAL image's pixel coordinates
     points_array = np.array(sketch_points, dtype=np.float32) / scale
     points_array = points_array.astype(np.int32)
 
-    fixed_mask = np.zeros(roi_patch.shape, dtype="uint8")  # original (non-upscaled) size
-    cv2.fillPoly(fixed_mask, [points_array], 255)
+    mask = np.zeros(roi_patch.shape, dtype="uint8")
+    cv2.fillPoly(mask, [points_array], 255)
 
     Path("output").mkdir(exist_ok=True)
-    cv2.imwrite(save_path, fixed_mask)
-    print(f"Sketch-based mask saved to {save_path} -- open it to check the shape.")
+    cv2.imwrite(save_path, mask)
 
-    return fixed_mask
+    return mask
 
 
-# ---------- Apply the fixed mask to a frame ----------
-def analyze_frame(gray_img, color_img, box, fixed_mask, filename):
+# ---------- Analyze one frame: ice sketch relative to fixed container ----------
+def analyze_frame(gray_img, color_img, box, ice_mask, container_pixel_count, filename):
     """
-    Applies the fixed mask (locked shape from frame 1) to the current frame.
+    Uses this frame's hand-sketched ice_mask, measured against the
+    FIXED container pixel count (same for every frame), to compute:
+      - mean_brightness: grayscale mean within the sketched ice region
+      - ice_fraction: (ice pixels sketched this frame) / (fixed container pixels)
+      - mean_rgb: (R, G, B) mean color within the sketched ice region
 
-    Returns:
-      - mean_brightness: grayscale mean within the masked region right now
-      - ice_fraction: what % of that fixed region still reads as bright/ice
-      - mean_rgb: (R, G, B) mean color within the masked region right now
-
-    Also saves two visual sanity-check images per frame:
-      - output/masked_<filename>       : original colors, non-slurry blacked out
-      - output/mask_overlay_<filename> : green outline of the fixed mask over the frame
+    Also saves a visual sanity-check image:
+      - output/masked_<filename> : original colors, non-ice blacked out
     """
     x1, y1, x2, y2 = box
     gray_patch = gray_img[y1:y2, x1:x2]
     color_patch = color_img[y1:y2, x1:x2]
 
-    # --- grayscale metrics (unchanged) ---
-    region_pixels = gray_patch[fixed_mask == 255]
+    region_pixels = gray_patch[ice_mask == 255]
     mean_brightness = region_pixels.mean()
 
-    _, current_threshold = cv2.threshold(gray_patch, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    still_ice = cv2.bitwise_and(current_threshold, fixed_mask)
-    ice_fraction = still_ice[still_ice == 255].size / fixed_mask[fixed_mask == 255].size
+    ice_fraction = np.sum(ice_mask == 255) / container_pixel_count
 
-    # --- NEW: save the actual per-pixel classification so you can see what's counted as "ice" ---
-    cv2.imwrite(f"output/still_ice_{filename}", still_ice)
-
-    # --- NEW: RGB mean within the same fixed mask ---
-    masked_color_pixels = color_patch[fixed_mask == 255]  # BGR order (OpenCV default)
+    masked_color_pixels = color_patch[ice_mask == 255]  # BGR order
     mean_bgr = masked_color_pixels.mean(axis=0)
-    mean_rgb = (mean_bgr[2], mean_bgr[1], mean_bgr[0])  # reorder to R, G, B for readability
+    mean_rgb = (mean_bgr[2], mean_bgr[1], mean_bgr[0])
 
-    # --- NEW: save a visual sanity-check image for this frame ---
     Path("output").mkdir(exist_ok=True)
-
     masked_visual = color_patch.copy()
-    masked_visual[fixed_mask == 0] = 0  # black out everything outside the fixed slurry shape
+    masked_visual[ice_mask == 0] = 0
     cv2.imwrite(f"output/masked_{filename}", masked_visual)
-
-    overlay = color_patch.copy()
-    contours, _ = cv2.findContours(fixed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(overlay, contours, -1, (0, 255, 0), 2)  # green outline
-    cv2.imwrite(f"output/mask_overlay_{filename}", overlay)
 
     return mean_brightness, ice_fraction, mean_rgb
 
@@ -212,40 +199,56 @@ if __name__ == "__main__":
     plt.title("Ice Slurry Melting Progression (Box Method)")
     plt.show()
 
-    # --- Method 2: sketch-based fixed mask ---
+    # --- Method 2, Step A: sketch the FIXED CONTAINER region, once, on frame 1 ---
     first_filename, first_gray_img = gray_images[0]
-    print(f"\nOpening sketch window on {first_filename} -- "
-          f"click and drag to trace the slurry outline, then press any key.")
-    fixed_mask = sketch_mask(first_gray_img, ice_roi)
+    print(f"\nStep A: sketch the CONTAINER region (overall slurry/liquid area) on {first_filename}.")
+    print("This defines the fixed denominator used for every frame's ice_fraction.")
+    container_mask = sketch_mask(
+        first_gray_img, ice_roi,
+        save_path="output/container_mask.png",
+        prompt_label="CONTAINER region (overall slurry/liquid area)"
+    )
+    container_pixel_count = np.sum(container_mask == 255)
+    print(f"Container area locked in: {container_pixel_count} pixels.")
 
-    print("\n[Fixed-mask method] Tracking brightness + ice fraction + color:")
+    # --- Method 2, Step B: sketch the actual ICE on EVERY frame ---
+    print("\nStep B: sketch just the ICE (not liquid) on each frame as it opens.")
     mask_results = []
     for i, (filename, gray_img) in enumerate(gray_images):
-        _, color_img = images[i]  # matching original color image, same order as gray_images
+        _, color_img = images[i]
+
+        print(f"  -> Sketching ICE in {filename} ({i + 1}/{len(gray_images)})...")
+        ice_mask = sketch_mask(
+            gray_img, ice_roi,
+            save_path=f"output/ice_mask_{filename}",
+            prompt_label="ICE only (not liquid)"
+        )
+
         mean_brightness, ice_fraction, mean_rgb = analyze_frame(
-            gray_img, color_img, ice_roi, fixed_mask, filename
+            gray_img, color_img, ice_roi, ice_mask, container_pixel_count, filename
         )
         time_elapsed = times[i]
         mask_results.append((time_elapsed, mean_brightness, ice_fraction, mean_rgb))
-        print(f"  t={time_elapsed}s | {filename}: "
-              f"brightness={mean_brightness:.2f}, ice_fraction={ice_fraction:.3f}, "
+        print(f"     t={time_elapsed}s | brightness={mean_brightness:.2f}, "
+              f"ice_fraction={ice_fraction:.3f}, "
               f"RGB=({mean_rgb[0]:.1f}, {mean_rgb[1]:.1f}, {mean_rgb[2]:.1f})")
 
-    print("\nSaved per-frame visual sanity checks to output/masked_*.png and output/mask_overlay_*.png")
+    print("\nSaved container mask to output/container_mask.png")
+    print("Saved per-frame ice masks to output/ice_mask_*.png and visuals to output/masked_*.png")
 
     mask_times, mask_brightness, mask_ice_fraction, mask_rgb = zip(*mask_results)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     ax1.plot(mask_times, mask_brightness, marker="o", color="tab:blue")
     ax1.set_xlabel("Time (seconds)")
-    ax1.set_ylabel("Mean Brightness (fixed mask region)")
-    ax1.set_title("Brightness Over Time (Fixed Mask)")
+    ax1.set_ylabel("Mean Brightness (sketched ice region)")
+    ax1.set_title("Brightness Over Time (Sketch Method)")
 
     ax2.plot(mask_times, mask_ice_fraction, marker="o", color="tab:orange")
     ax2.set_xlabel("Time (seconds)")
-    ax2.set_ylabel("Ice Fraction (0-1)")
+    ax2.set_ylabel("Ice Fraction (relative to fixed container)")
     ax2.set_title("Remaining Ice Fraction Over Time")
 
     plt.tight_layout()
-    plt.savefig("output/melt_progression_fixed_mask.png")
+    plt.savefig("output/melt_progression_sketch.png")
     plt.show()
