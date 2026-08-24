@@ -152,6 +152,9 @@ def analyze_frame(gray_img, color_img, box, fixed_mask, filename):
     still_ice = cv2.bitwise_and(current_threshold, fixed_mask)
     ice_fraction = still_ice[still_ice == 255].size / fixed_mask[fixed_mask == 255].size
 
+    # --- NEW: save the actual per-pixel classification so you can see what's counted as "ice" ---
+    cv2.imwrite(f"output/still_ice_{filename}", still_ice)
+
     # --- NEW: RGB mean within the same fixed mask ---
     masked_color_pixels = color_patch[fixed_mask == 255]  # BGR order (OpenCV default)
     mean_bgr = masked_color_pixels.mean(axis=0)
@@ -189,7 +192,7 @@ if __name__ == "__main__":
         brightness = get_brightness(gray_img, rim_petri_dish)
         print(f"  {filename}: rim brightness = {brightness:.2f}")
 
-    ice_roi = (435 - 50, 1001 - 50, 906 + 50, 1382 + 50)
+    ice_roi = (435-100, 1001-100, 906+100, 1382+100)
     time_interval = 15
     times = [i * time_interval for i in range(len(gray_images))]
 
