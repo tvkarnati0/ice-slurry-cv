@@ -18,18 +18,18 @@ Two parallel methods are run:
      each frame, frame 1 does NOT have to equal 1.0 -- if some liquid
      was already present at the start, frame 1's fraction reflects that.
 """
-
+#import libraries
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
 
-# ---------- Load ----------
+#create function to load the images, double check file names
 def load_images(folder_path: str = "images", pattern: str = "*.png"):
-    folder = Path(folder_path)
+    folder = Path(folder_path) #locate folder, .png files
 
-    if not folder.exists():
+    if not folder.exists(): #check if folder exists
         raise FileNotFoundError(f"Folder not found: {folder.resolve()}")
 
     image_paths = sorted(folder.glob(pattern))
@@ -39,7 +39,7 @@ def load_images(folder_path: str = "images", pattern: str = "*.png"):
 
     loaded = []
     for path in image_paths:
-        img = cv2.imread(str(path))
+        img = cv2.imread(str(path)) #image --> pixel values
         if img is None:
             print(f"Warning: failed to load {path.name}")
             continue
@@ -48,112 +48,106 @@ def load_images(folder_path: str = "images", pattern: str = "*.png"):
     return loaded
 
 
-# ---------- Grayscale ----------
+#create grayscale function
 def convert_to_grayscale(images: list) -> list:
     grayscale = []
     for filename, img in images:
-        gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        grayscale.append((filename, gray_img))
+        gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) #convert image to grayscale
+        grayscale.append((filename, gray_img)) #create a new image and label for grayscale image
     return grayscale
 
 
-# ---------- Plain rectangular brightness (box method + rim check) ----------
+#Takes a certain section of image and identifies changes in brightness, consistent lighting check
 def get_brightness(gray_img, box):
     x1, y1, x2, y2 = box
     patch = gray_img[y1:y2, x1:x2]
     return patch.mean()
 
 
-# ---------- Interactive freehand sketch -> filled mask ----------
+#Identify section with slurry/liquid, will represent the total amount of "stuff" coming out of the syringe (solid+liquid)
 def sketch_mask(gray_img, box, save_path, prompt_label, target_size=1200):
-    """
-    Opens a window showing this frame's ROI, upscaled so its largest
-    dimension is roughly `target_size` pixels. Click and drag to sketch
-    an outline. Press any key when done. Returns the filled-in binary
-    mask, sized to match the ORIGINAL (non-upscaled) ROI dimensions.
 
-    `prompt_label` is shown in the window title so you know what to
-    sketch (e.g. "CONTAINER region" vs "ICE only").
-    """
+    #gets box coordinates from new area
     x1, y1, x2, y2 = box
     roi_patch = gray_img[y1:y2, x1:x2]
 
+    #enlarge the image and get target size
     h, w = roi_patch.shape
     scale = target_size / max(h, w)
 
+    #resize the image
     display_img = cv2.resize(roi_patch, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
-    display_img = cv2.cvtColor(display_img, cv2.COLOR_GRAY2BGR)
+    display_img = cv2.cvtColor(display_img, cv2.COLOR_GRAY2BGR) #convert back to BGR for image outline, most accurate
 
+    #create drawing tool, based on holding mouse button down
     drawing = {"active": False}
-    sketch_points = []
+    sketch_points = [] #empty list, will be filled with points determiend from skectched line
 
+    #instruction window
     window_name = f"Sketch the {prompt_label}, then press any key -- {save_path}"
 
+    #drawing function, mouse control
     def draw_event(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
+        if event == cv2.EVENT_LBUTTONDOWN: #pressed button, record mouse movement
             drawing["active"] = True
             sketch_points.append((x, y))
 
         elif event == cv2.EVENT_MOUSEMOVE:
             if drawing["active"]:
-                sketch_points.append((x, y))
-                cv2.circle(display_img, (x, y), 2, (0, 255, 0), -1)
-                cv2.imshow(window_name, display_img)
+                sketch_points.append((x, y)) #add points into dataset
+                cv2.circle(display_img, (x, y), 2, (0, 255, 0), -1) #indicates it is filled /colored
+                cv2.imshow(window_name, display_img) #show cropped/updated image
 
-        elif event == cv2.EVENT_LBUTTONUP:
+        elif event == cv2.EVENT_LBUTTONUP:#release button, stop drawing
             drawing["active"] = False
 
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(window_name, draw_event)
     cv2.imshow(window_name, display_img)
 
-    while True:
+    while True: #press key to finish image
         key = cv2.waitKey(20) & 0xFF
         if key != 255:
             break
 
-    cv2.destroyAllWindows()
+    cv2.destroyAllWindows() #close windo
 
-    if len(sketch_points) < 3:
+    if len(sketch_points) < 3: #ensures minimum number of points exist
         raise ValueError("Not enough points sketched to form a shape. Try again.")
 
     points_array = np.array(sketch_points, dtype=np.float32) / scale
     points_array = points_array.astype(np.int32)
 
     mask = np.zeros(roi_patch.shape, dtype="uint8")
-    cv2.fillPoly(mask, [points_array], 255)
+    cv2.fillPoly(mask, [points_array], 255) #fills inside of shape to calculate area/# of pixels
 
     Path("output").mkdir(exist_ok=True)
-    cv2.imwrite(save_path, mask)
+    cv2.imwrite(save_path, mask) #save new image
 
     return mask
 
 
-# ---------- Analyze one frame: ice sketch relative to fixed container ----------
+# Manually sketch on frame to mark ice frame
 def analyze_frame(gray_img, color_img, box, ice_mask, container_pixel_count, filename):
-    """
-    Uses this frame's hand-sketched ice_mask, measured against the
-    FIXED container pixel count (same for every frame), to compute:
-      - mean_brightness: grayscale mean within the sketched ice region
-      - ice_fraction: (ice pixels sketched this frame) / (fixed container pixels)
-      - mean_rgb: (R, G, B) mean color within the sketched ice region
 
-    Also saves a visual sanity-check image:
-      - output/masked_<filename> : original colors, non-ice blacked out
-    """
+    # make a smaller region for accuracy when tracing
     x1, y1, x2, y2 = box
     gray_patch = gray_img[y1:y2, x1:x2]
     color_patch = color_img[y1:y2, x1:x2]
 
+    # Define region to analyze
     region_pixels = gray_patch[ice_mask == 255]
     mean_brightness = region_pixels.mean()
 
+    # only grab grayscale values of the selected region
     ice_fraction = np.sum(ice_mask == 255) / container_pixel_count
 
+    # Gives average "color" of ice
     masked_color_pixels = color_patch[ice_mask == 255]  # BGR order
     mean_bgr = masked_color_pixels.mean(axis=0)
     mean_rgb = (mean_bgr[2], mean_bgr[1], mean_bgr[0])
 
+    # create an output folder with copies of color images and removes eveyrthing that is not ice
     Path("output").mkdir(exist_ok=True)
     masked_visual = color_patch.copy()
     masked_visual[ice_mask == 0] = 0
@@ -163,19 +157,20 @@ def analyze_frame(gray_img, color_img, box, ice_mask, container_pixel_count, fil
 
 
 if __name__ == "__main__":
-    # --- Load and convert ---
+    # Call load images function that is stores
     images = load_images()
-    print(f"\nLoaded {len(images)} image(s):")
-    for filename, img in images:
+    print(f"\nLoaded {len(images)} image(s):") #counts number of images loaded
+    for filename, img in images: #loop through images to get shape and filename
         print(f"  {filename} -> shape {img.shape}")
 
+    #convert images to grayscale
     gray_images = convert_to_grayscale(images)
     print(f"\nConverted {len(gray_images)} image(s) to grayscale.")
 
-    # --- Rim check (lighting stability) ---
+    # Define the rim region and measure brightness
     rim_petri_dish = (370, 947, 380, 965)
     print("\nRim brightness (lighting stability check):")
-    for filename, gray_img in gray_images:
+    for filename, gray_img in gray_images: #measure rim brightness 
         brightness = get_brightness(gray_img, rim_petri_dish)
         print(f"  {filename}: rim brightness = {brightness:.2f}")
 
@@ -183,7 +178,7 @@ if __name__ == "__main__":
     time_interval = 15
     times = [i * time_interval for i in range(len(gray_images))]
 
-    # --- Method 1: plain box ---
+    #Calculation of average brightness of ice ROI 
     print("\n[Box method] Ice brightness:")
     results = []
     for i, (filename, gray_img) in enumerate(gray_images):
@@ -199,7 +194,7 @@ if __name__ == "__main__":
     plt.title("Ice Slurry Melting Progression (Box Method)")
     plt.show()
 
-    # --- Method 2, Step A: sketch the FIXED CONTAINER region, once, on frame 1 ---
+    # Identify total ice ROI
     first_filename, first_gray_img = gray_images[0]
     print(f"\nStep A: sketch the CONTAINER region (overall slurry/liquid area) on {first_filename}.")
     print("This defines the fixed denominator used for every frame's ice_fraction.")
@@ -211,12 +206,13 @@ if __name__ == "__main__":
     container_pixel_count = np.sum(container_mask == 255)
     print(f"Container area locked in: {container_pixel_count} pixels.")
 
-    # --- Method 2, Step B: sketch the actual ICE on EVERY frame ---
+    # Manually trace ice chunks at EACH frame
     print("\nStep B: sketch just the ICE (not liquid) on each frame as it opens.")
     mask_results = []
-    for i, (filename, gray_img) in enumerate(gray_images):
+    for i, (filename, gray_img) in enumerate(gray_images): # matches each image to the corresponding time
         _, color_img = images[i]
 
+        # label the prompt and give instructions 
         print(f"  -> Sketching ICE in {filename} ({i + 1}/{len(gray_images)})...")
         ice_mask = sketch_mask(
             gray_img, ice_roi,
@@ -224,6 +220,7 @@ if __name__ == "__main__":
             prompt_label="ICE only (not liquid)"
         )
 
+        # use analyze frame function to produce three outputs
         mean_brightness, ice_fraction, mean_rgb = analyze_frame(
             gray_img, color_img, ice_roi, ice_mask, container_pixel_count, filename
         )
@@ -238,12 +235,14 @@ if __name__ == "__main__":
 
     mask_times, mask_brightness, mask_ice_fraction, mask_rgb = zip(*mask_results)
 
+    # Create brightness plot over time
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     ax1.plot(mask_times, mask_brightness, marker="o", color="tab:blue")
     ax1.set_xlabel("Time (seconds)")
     ax1.set_ylabel("Mean Brightness (sketched ice region)")
     ax1.set_title("Brightness Over Time (Sketch Method)")
 
+    # Create plot of the mask times and the content/ice fraction of the slurry
     ax2.plot(mask_times, mask_ice_fraction, marker="o", color="tab:orange")
     ax2.set_xlabel("Time (seconds)")
     ax2.set_ylabel("Ice Fraction (relative to fixed container)")
